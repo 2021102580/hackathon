@@ -1,11 +1,3 @@
-"""Self-contained staged income prediction pipeline.
-
-Only the labelled training table and the unlabelled inference table are inputs.
-Every structural, out-of-fold and meta prediction is rebuilt in this process.
-Generated CSV files are audit outputs only: downstream stages consume in-memory
-arrays and never read prediction artifacts. ``dt`` is an as-of date used only
-for relative ages and optional strict latest-date evaluation.
-"""
 from __future__ import annotations
 
 import argparse
@@ -26,6 +18,10 @@ ID_COL, TARGET_COL, WEIGHT_COL, ASOF_COL = "id", "target", "w", "dt"
 STAGES = ["center", "tail150", "tail200", "tail_mix", "catboost_mix", "structural_sources", "structural_final", "anchor_v2"]
 CENTER = 84017.079961153
 TAIL_THRESHOLDS = (150000.0, 200000.0)
+DIRECT_MIDDLE_SCHEDULE = (0.50, 0.50, 0.75, 1.0, 1.0)
+DIRECT_LOCAL_SCHEDULE = (0.625, 0.75, 1.0, 1.0, 1.0)
+HALF_SCHEDULE = (0.5625, 0.625, 0.875, 1.0, 1.0)
+SELECTED_SCHEDULE = DIRECT_LOCAL_SCHEDULE
 KNOWN_CATEGORICAL = {"gender", "adminarea", "addrref", "city_smart_name", "dp_address_unique_regions", "dp_ewb_last_organization"}
 SOURCE_COLUMNS = {
     "salary": ["salary_6to12m_avg"],
@@ -135,6 +131,9 @@ class FeatureBuilder:
 
     def fit(self, raw: pd.DataFrame) -> "FeatureBuilder":
         self.__init__()
+        if ASOF_COL not in raw:
+            raise ValueError("dt is required for date features")
+        parse_iso_date(raw[ASOF_COL], ASOF_COL)
         for c in raw.columns:
             if c in {ID_COL, TARGET_COL, WEIGHT_COL, ASOF_COL}: continue
             if c == "period_last_act_ad":
@@ -147,8 +146,7 @@ class FeatureBuilder:
                 for special in ("__MISSING__", "__OTHER__"):
                     if special not in vals: vals.append(special)
                 self.categories[c] = vals
-        self.required = list(self.used)
-        if "period_last_act_ad" in self.used: self.required.append(ASOF_COL)
+        self.required = list(self.used) + [ASOF_COL]
         for c in self.used:
             if c not in self.categories and c != "period_last_act_ad": self.domains.setdefault(domain(c), []).append(c)
         for d, cols in self.domains.items():
@@ -161,7 +159,15 @@ class FeatureBuilder:
         if missing: raise ValueError(f"Input is missing fitted feature columns: {missing[:10]}")
         data: dict[str, pd.Series] = {}
         numeric: list[str] = []
-        asof = parse_iso_date(raw[ASOF_COL], ASOF_COL) if "period_last_act_ad" in self.used else None
+        asof = parse_iso_date(raw[ASOF_COL], ASOF_COL)
+        angle = 2.0 * np.pi * (asof.dt.month.astype("float32") - 1.0) / 12.0
+        data["dt_year"] = asof.dt.year.astype("float32")
+        data["dt_month"] = asof.dt.month.astype("float32")
+        data["dt_quarter"] = asof.dt.quarter.astype("float32")
+        data["dt_ord"] = (asof.dt.year * 12 + asof.dt.month).astype("float32")
+        data["dt_month_sin"] = np.sin(angle).astype("float32")
+        data["dt_month_cos"] = np.cos(angle).astype("float32")
+        numeric.extend(["dt_year", "dt_month", "dt_quarter", "dt_ord", "dt_month_sin", "dt_month_cos"])
         for c in self.used:
             if c in self.categories:
                 s = raw[c].astype("string").fillna("__MISSING__")
@@ -215,7 +221,6 @@ class Config:
     selected_trees: int = 300
     selector_trees: int = 260
     top_k: int = 100
-    endpoint_alpha: float = .75
     use_catboost: bool = True
 
     @classmethod
@@ -392,13 +397,47 @@ def signed_decode(base: np.ndarray, q: np.ndarray, shrink: float) -> np.ndarray:
     z = shrink * q; return base * (1 + np.sign(z) * np.expm1(np.abs(z)))
 
 
-def build_meta(raw: pd.DataFrame, x: pd.DataFrame, stages: dict[str, np.ndarray]) -> pd.DataFrame:
+def sorted_date_horizon(raw: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
+    """Map sorted unique as-of dates in this frame to deterministic horizons 1..N."""
+    if ASOF_COL not in raw:
+        raise ValueError("dt is required for forecast_horizon")
+    dates = parse_iso_date(raw[ASOF_COL], ASOF_COL)
+    if dates.isna().any():
+        raise ValueError("dt must not contain missing values when forecast_horizon is enabled")
+    unique = sorted(pd.Timestamp(v) for v in dates.unique())
+    mapping = {value: i + 1 for i, value in enumerate(unique)}
+    horizon = dates.map(mapping).to_numpy(dtype="int16")
+    return horizon, [value.strftime("%Y-%m-%d") for value in unique]
+
+
+def schedule_values(horizon: np.ndarray, schedule: tuple[float, ...]) -> np.ndarray:
+    """Return per-row coefficients, using the final coefficient beyond horizon 5."""
+    h = np.asarray(horizon, dtype=int)
+    if np.any(h < 1):
+        raise ValueError("forecast_horizon must be positive")
+    return np.asarray(schedule, dtype=float)[np.minimum(h - 1, len(schedule) - 1)]
+
+
+def scheduled_blend(base: np.ndarray, model: np.ndarray, horizon: np.ndarray, schedule: tuple[float, ...]) -> np.ndarray:
+    alpha = schedule_values(horizon, schedule)
+    return (1.0 - alpha) * np.asarray(base, float) + alpha * np.asarray(model, float)
+
+
+def build_meta(raw: pd.DataFrame, x: pd.DataFrame, stages: dict[str, np.ndarray], horizon: np.ndarray | None = None) -> pd.DataFrame:
     z = x.copy(); base = stages["anchor_v2"]
+    if horizon is None:
+        horizon, _ = sorted_date_horizon(raw)
+    horizon = np.asarray(horizon, dtype="int16")
+    if len(horizon) != len(z):
+        raise ValueError("forecast_horizon length differs from meta frame")
     for name in STAGES: z[f"stage_{name}"] = np.asarray(stages[name], dtype="float32")
     z["stage_log_anchor"] = np.log1p(base).astype("float32")
     z["stage_tail_lift"] = (stages["tail_mix"] - stages["center"]).astype("float32")
     z["stage_catboost_delta"] = (stages["catboost_mix"] - stages["tail_mix"]).astype("float32")
     z["stage_source_delta"] = (stages["structural_sources"] - stages["catboost_mix"]).astype("float32")
+    z["forecast_horizon"] = horizon
+    z["base_x_horizon"] = (base * horizon).astype("float32")
+    z["tail_x_horizon"] = ((stages["tail_mix"] - stages["center"]) * horizon).astype("float32")
     vals = []
     for c in META_RAW:
         if c not in z: continue
@@ -429,29 +468,86 @@ def fit_xgb(model: XGBRegressor, x: pd.DataFrame, y: np.ndarray, w: np.ndarray, 
         model.set_params(device="cpu"); model.fit(x, y, sample_weight=w); return model
 
 
+def frozen_origin_structural_frame(train: pd.DataFrame, cfg: Config, runtime: Runtime) -> tuple[pd.DataFrame, dict[str, np.ndarray], dict]:
+    """Create strict frozen-origin structural predictions for meta training.
+
+    The latest four eligible as-of dates are used as origins.  Every model sees
+    only rows strictly before its origin and predicts every target date at or
+    after that origin.  A client can therefore occur multiple times with
+    genuinely different origin/horizon contexts.
+    """
+    dates = parse_iso_date(train[ASOF_COL], ASOF_COL)
+    unique = sorted(pd.Timestamp(value) for value in dates.unique())
+    position = {value: i for i, value in enumerate(unique)}
+    eligible = []
+    for origin in unique:
+        fit_mask = (dates < origin).to_numpy()
+        if int(fit_mask.sum()) >= 8:
+            eligible.append(origin)
+    origins = eligible[-4:]
+    if not origins:
+        raise ValueError("No eligible frozen origin has at least 8 earlier training rows")
+
+    records: list[pd.DataFrame] = []
+    stage_parts: dict[str, list[np.ndarray]] = {name: [] for name in STAGES}
+    for number, origin in enumerate(origins):
+        fit_mask = (dates < origin).to_numpy()
+        pred_mask = (dates >= origin).to_numpy()
+        pred_index = np.flatnonzero(pred_mask)
+        origin_text = origin.strftime("%Y-%m-%d")
+        log(f"Frozen-origin structural {number + 1}/{len(origins)} origin={origin_text} fit={fit_mask.sum()} predict={pred_mask.sum()}")
+        local_cfg = Config(**{**asdict(cfg), "seed": cfg.seed + 1000 * number})
+        pred_raw = train.iloc[pred_index].drop(columns=[TARGET_COL, WEIGHT_COL], errors="ignore")
+        predicted = fit_structural(train.loc[fit_mask].copy(), pred_raw, local_cfg, runtime)
+        target_dates = dates.iloc[pred_index]
+        horizon = np.array([position[pd.Timestamp(value)] - position[origin] + 1 for value in target_dates], dtype="int16")
+        records.append(pd.DataFrame({
+            "source_raw_index": pred_index,
+            "origin_date": origin_text,
+            "target_date": target_dates.dt.strftime("%Y-%m-%d").to_numpy(),
+            "forecast_horizon": horizon,
+        }))
+        for name in STAGES:
+            stage_parts[name].append(np.asarray(predicted[name], dtype=float))
+
+    frame = pd.concat(records, ignore_index=True)
+    stages = {name: np.concatenate(parts) for name, parts in stage_parts.items()}
+    details = {
+        "policy": "latest up to 4 eligible frozen origins; fit dt < origin; predict dt >= origin",
+        "eligible_origins": [value.strftime("%Y-%m-%d") for value in eligible],
+        "used_origins": [value.strftime("%Y-%m-%d") for value in origins],
+        "rows": len(frame),
+    }
+    return frame, stages, details
+
+
 def run_graph(train: pd.DataFrame, test: pd.DataFrame, cfg: Config, runtime: Runtime) -> tuple[np.ndarray, dict, dict[str, pd.DataFrame]]:
     if cfg.folds < 2: raise ValueError("folds must be at least 2")
-    raw_order_by_id = pd.Series(np.arange(len(train), dtype=int), index=train[ID_COL])
     train = canonicalize(train, cfg.seed)
-    raw_order = raw_order_by_id.loc[train[ID_COL]].to_numpy(int)
-    y = to_numeric(train[TARGET_COL]).to_numpy(float); w = to_numeric(train[WEIGHT_COL]).to_numpy(float) if WEIGHT_COL in train else np.ones(len(train))
-    clip = clip_factory(y); folds = make_folds(train, cfg.folds, cfg.seed)
-    oof = {s: np.empty(len(train), float) for s in STAGES}
-    for f, (tr, va) in enumerate(folds):
-        log(f"Structural OOF fold {f + 1}/{len(folds)}")
-        local_cfg = Config(**{**asdict(cfg), "seed": cfg.seed + 1000 * f})
-        pred = fit_structural(train.iloc[tr], train.iloc[va].drop(columns=[TARGET_COL, WEIGHT_COL], errors="ignore"), local_cfg, runtime)
-        for s in STAGES: oof[s][va] = pred[s]
+    train_y = to_numeric(train[TARGET_COL]).to_numpy(float)
+    train_w = to_numeric(train[WEIGHT_COL]).to_numpy(float) if WEIGHT_COL in train else np.ones(len(train))
+    clip = clip_factory(train_y)
+
+    frozen, oof, origin_report = frozen_origin_structural_frame(train, cfg, runtime)
+    source_index = frozen["source_raw_index"].to_numpy(int)
+    y, w = train_y[source_index], train_w[source_index]
+
     log("Structural full-train inference stages")
     test_stages = fit_structural(train, test, cfg, runtime)
-    # Common train-fitted feature space for meta learners.
-    builder = FeatureBuilder(); x = builder.fit_transform(train); xt = builder.transform(test)
-    mo = build_meta(train, x, oof); mt = build_meta(test, xt, test_stages)
+    # Fit the common feature schema on all supplied train rows, then align it to
+    # the duplicated frozen-origin records.  No inference-row state is learned.
+    builder = FeatureBuilder(); x_all = builder.fit_transform(train); xt = builder.transform(test)
+    x = x_all.iloc[source_index].reset_index(drop=True)
+    meta_raw = train.iloc[source_index].reset_index(drop=True)
+    train_horizon = frozen["forecast_horizon"].to_numpy("int16")
+    test_horizon, test_dates = sorted_date_horizon(test)
+    mo = build_meta(meta_raw, x, oof, train_horizon); mt = build_meta(test, xt, test_stages, test_horizon)
     base_oof, base_test = oof["anchor_v2"], test_stages["anchor_v2"]
     pred_cols = [c for c in mo if c.startswith("stage_")]
     block_cols = [c for c in mo if c.startswith("availability_")]
     ratio_cols = [c for c in mo if c.startswith("anchor_lr_") and any(p in c for p in ("salary_6to12m", "dp_payout", "dp_ils"))]
-    meta_cols = list(dict.fromkeys(pred_cols + [c for c in META_RAW if c in mo] + block_cols + ["row_missing_count"] + ratio_cols))
+    horizon_cols = ["forecast_horizon", "base_x_horizon", "tail_x_horizon"]
+    meta_cols = list(dict.fromkeys(pred_cols + horizon_cols + [c for c in META_RAW if c in mo] + block_cols + ["row_missing_count"] + ratio_cols))
     meta_cats = [c for c in meta_cols if str(mo[c].dtype) == "category"]
     # Residual-v3 is the common fallback/anchor for every endpoint.
     log_ratio_target = np.log(np.maximum(y, 1) / np.maximum(base_oof, 1))
@@ -506,11 +602,17 @@ def run_graph(train: pd.DataFrame, test: pd.DataFrame, cfg: Config, runtime: Run
         selected_parts.append(clip(signed_decode(base_test, m.predict(mt[selected_cols]), .85)))
     selected_raw_train, selected_raw_pred = np.mean(selected_train_parts, axis=0), np.mean(selected_parts, axis=0)
 
-    a = cfg.endpoint_alpha
-    direct_endpoint_train, direct_endpoint = (1-a)*v3_train+a*direct_raw_train, (1-a)*v3+a*direct_raw
-    signed_endpoint_train, signed_endpoint = (1-a)*v3_train+a*signed_raw_train, (1-a)*v3+a*signed_raw
-    full_endpoint_train, full_endpoint = (1-a)*v3_train+a*full_raw_train, (1-a)*v3+a*full_raw
-    selected_endpoint_train, selected_endpoint = (1-a)*v3_train+a*selected_raw_train, (1-a)*v3+a*selected_raw_pred
+    direct_middle_train = scheduled_blend(v3_train, direct_raw_train, train_horizon, DIRECT_MIDDLE_SCHEDULE)
+    direct_middle = scheduled_blend(v3, direct_raw, test_horizon, DIRECT_MIDDLE_SCHEDULE)
+    direct_local_train = scheduled_blend(v3_train, direct_raw_train, train_horizon, DIRECT_LOCAL_SCHEDULE)
+    direct_local = scheduled_blend(v3, direct_raw, test_horizon, DIRECT_LOCAL_SCHEDULE)
+    direct_endpoint_train, direct_endpoint = .5 * (direct_middle_train + direct_local_train), .5 * (direct_middle + direct_local)
+    signed_endpoint_train = scheduled_blend(v3_train, signed_raw_train, train_horizon, HALF_SCHEDULE)
+    signed_endpoint = scheduled_blend(v3, signed_raw, test_horizon, HALF_SCHEDULE)
+    full_endpoint_train = scheduled_blend(v3_train, full_raw_train, train_horizon, HALF_SCHEDULE)
+    full_endpoint = scheduled_blend(v3, full_raw, test_horizon, HALF_SCHEDULE)
+    selected_endpoint_train = scheduled_blend(v3_train, selected_raw_train, train_horizon, SELECTED_SCHEDULE)
+    selected_endpoint = scheduled_blend(v3, selected_raw_pred, test_horizon, SELECTED_SCHEDULE)
     signed_x150_train = clip(direct_endpoint_train + 1.5*(signed_endpoint_train-direct_endpoint_train))
     signed_x150 = clip(direct_endpoint + 1.5*(signed_endpoint-direct_endpoint))
     historical_base_train = clip(.8*signed_x150_train + .2*full_endpoint_train)
@@ -518,23 +620,43 @@ def run_graph(train: pd.DataFrame, test: pd.DataFrame, cfg: Config, runtime: Run
     final_train = clip(.9*historical_base_train + .1*selected_endpoint_train)
     final = clip(.9*historical_base + .1*selected_endpoint)
 
-    components_oof = pd.DataFrame({ID_COL: train[ID_COL], "raw_order": raw_order, TARGET_COL: y, WEIGHT_COL: w, **{s: oof[s] for s in STAGES}}).sort_values("raw_order")
-    components_test = pd.DataFrame({ID_COL: test[ID_COL], **{s: test_stages[s] for s in STAGES}})
-    meta_oof = pd.DataFrame({ID_COL: train[ID_COL], "raw_order": raw_order, TARGET_COL: y, WEIGHT_COL: w,
+    frozen_keys = {
+        ID_COL: meta_raw[ID_COL].to_numpy(),
+        "canonical_raw_index": source_index,
+        "origin_date": frozen["origin_date"].to_numpy(),
+        "target_date": frozen["target_date"].to_numpy(),
+        "forecast_horizon": train_horizon,
+    }
+    components_oof = pd.DataFrame({**frozen_keys, TARGET_COL: y, WEIGHT_COL: w, **{s: oof[s] for s in STAGES}})
+    components_test = pd.DataFrame({ID_COL: test[ID_COL], "target_date": test[ASOF_COL].to_numpy(),
+                                    "forecast_horizon": test_horizon, **{s: test_stages[s] for s in STAGES}})
+    meta_oof = pd.DataFrame({**frozen_keys, TARGET_COL: y, WEIGHT_COL: w,
+        "base_x_horizon": mo["base_x_horizon"].to_numpy(float),
+        "tail_x_horizon": mo["tail_x_horizon"].to_numpy(float),
         "anchor_v2": base_oof, "signed_target": signed_target, "training_residual_v3": v3_train,
         "training_direct_raw": direct_raw_train, "training_direct_endpoint": direct_endpoint_train,
         "training_signed_raw": signed_raw_train, "training_signed_endpoint": signed_endpoint_train,
         "training_signed_x150": signed_x150_train, "training_full_raw": full_raw_train,
         "training_full_endpoint": full_endpoint_train, "training_selected_raw": selected_raw_train,
         "training_selected_endpoint": selected_endpoint_train, "training_historical_base": historical_base_train,
-        "training_final": final_train}).sort_values("raw_order")
-    meta_test = pd.DataFrame({ID_COL: test[ID_COL], "anchor_v2": base_test, "residual_v3": v3,
+        "training_final": final_train})
+    meta_test = pd.DataFrame({ID_COL: test[ID_COL], "forecast_horizon": test_horizon,
+        "base_x_horizon": mt["base_x_horizon"].to_numpy(float), "tail_x_horizon": mt["tail_x_horizon"].to_numpy(float),
+        "anchor_v2": base_test, "residual_v3": v3,
         "direct_raw": direct_raw, "direct_endpoint": direct_endpoint, "signed_raw": signed_raw,
         "signed_endpoint": signed_endpoint, "signed_x150": signed_x150, "full_raw": full_raw,
         "full_endpoint": full_endpoint, "selected_raw": selected_raw_pred,
         "selected_endpoint": selected_endpoint, "historical_base": historical_base, "predict": final})
-    report = {"stage_schema": STAGES, "folds": len(folds), "center": CENTER, "tail_thresholds": list(TAIL_THRESHOLDS),
-              "blend": {"endpoint_alpha": a, "signed_extrapolation": 1.5,
+    train_dates = sorted(parse_iso_date(train[ASOF_COL], ASOF_COL).dt.strftime("%Y-%m-%d").unique().tolist())
+    report = {"stage_schema": STAGES, "center": CENTER, "tail_thresholds": list(TAIL_THRESHOLDS),
+              "dates": {"train_sorted": train_dates, "test_sorted": test_dates,
+                        "horizon_policy": "frozen-origin meta rows use target-position minus origin-position plus one; test sorted unique dt maps to 1..N",
+                        "frozen_origin_oof": origin_report},
+              "blend": {"schedules": {"direct_middle": list(DIRECT_MIDDLE_SCHEDULE),
+                                        "direct_local": list(DIRECT_LOCAL_SCHEDULE),
+                                        "signed_half": list(HALF_SCHEDULE), "full_half": list(HALF_SCHEDULE),
+                                        "selected_local": list(SELECTED_SCHEDULE)},
+                        "direct_endpoint": {"middle": .5, "local": .5}, "signed_extrapolation": 1.5,
                         "historical_base": {"signed_x150": .8, "full_endpoint": .2},
                         "final": {"historical_base": .9, "selected_endpoint": .1}},
               "selected_features": selected_cols, "selected_additional_raw_features": selected_raw,
@@ -542,7 +664,7 @@ def run_graph(train: pd.DataFrame, test: pd.DataFrame, cfg: Config, runtime: Run
               "training_diagnostics": {"anchor_v2_crossfit_wmae": weighted_mae(y, base_oof, w),
                                        "training_component_warning": "second-level component columns are fitted on the OOF-stage frame and are training diagnostics, not strict outer predictions"},
               "feature_policy": "all transforms and selectors are fitted from the current training input only; inference rows only receive transform()",
-              "date_policy": "dt is excluded from model features and used only for relative age and optional latest-date evaluation"}
+              "date_policy": "dt supplies absolute calendar features, sorted forecast_horizon, horizon interactions, relative age, and latest-date evaluation"}
     return final, report, {"oof_structural_stages.csv": components_oof, "test_structural_stages.csv": components_test,
                             "oof_meta_components.csv": meta_oof, "test_meta_components.csv": meta_test}
 
@@ -558,8 +680,12 @@ def validate_inputs(train: pd.DataFrame, test: pd.DataFrame) -> None:
     if WEIGHT_COL in train:
         w = to_numeric(train[WEIGHT_COL]).to_numpy(float)
         if not np.isfinite(w).all() or np.any(w < 0) or w.sum() <= 0: raise ValueError("w must be finite, non-negative and positive in total")
-    if ASOF_COL in train: parse_iso_date(train[ASOF_COL], ASOF_COL)
-    if ASOF_COL in test: parse_iso_date(test[ASOF_COL], ASOF_COL)
+    if ASOF_COL not in train or ASOF_COL not in test:
+        raise ValueError("train and test require dt for restored date and horizon features")
+    train_dates = parse_iso_date(train[ASOF_COL], ASOF_COL)
+    test_dates = parse_iso_date(test[ASOF_COL], ASOF_COL)
+    if train_dates.isna().any() or test_dates.isna().any():
+        raise ValueError("dt must not contain missing values")
 
 
 def forward_validation(train: pd.DataFrame, cfg: Config) -> dict:
@@ -581,7 +707,8 @@ def validate_generated_values(prediction: np.ndarray, frames: dict[str, pd.DataF
         "oof_structural_stages.csv": STAGES,
         "test_structural_stages.csv": STAGES,
         "oof_meta_components.csv": ["anchor_v2", *[c for c in frames["oof_meta_components.csv"].columns if c.startswith("training_")]],
-        "test_meta_components.csv": [c for c in frames["test_meta_components.csv"].columns if c != ID_COL],
+        "test_meta_components.csv": [c for c in frames["test_meta_components.csv"].columns
+                                     if c not in {ID_COL, "forecast_horizon", "base_x_horizon", "tail_x_horizon"}],
     }
     arrays = [("final prediction", np.asarray(prediction, float))]
     for name, cols in checks.items():
